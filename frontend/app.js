@@ -3,7 +3,7 @@
    Handles form validation, API calls, and UI state
    ============================================================ */
 
-const API_URL = 'http://localhost:3000/api/generate';
+const API_URL = 'http://13.53.205.58/api/generate';
 
 // ── DOM References ──────────────────────────────────────────
 const form          = document.getElementById('cv-form');
