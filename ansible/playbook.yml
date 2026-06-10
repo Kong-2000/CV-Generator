@@ -1,0 +1,219 @@
+---
+# ==============================================================
+# CV Generator – ansible/playbook.yml
+# Configures a fresh Ubuntu 22.04 server to run the CV Generator
+# app behind an nginx reverse proxy, managed by pm2.
+# ==============================================================
+
+- name: Deploy CV Generator
+  hosts: cv_generator
+  become: true
+  vars:
+    app_repo: "https://github.com/Kong-2000/CV-Generator.git"
+    app_dir: "/home/ubuntu/CV-Generator"
+    node_version: "18"
+    app_port: 3000
+
+  tasks:
+
+    # ── System update ─────────────────────────────────────────
+    - name: Update apt cache
+      apt:
+        update_cache: true
+        cache_valid_time: 3600
+
+    - name: Upgrade all packages
+      apt:
+        upgrade: dist
+        autoremove: true
+
+    # ── Dependencies ──────────────────────────────────────────
+    - name: Install required system packages
+      apt:
+        name:
+          - git
+          - curl
+          - nginx
+          - ufw
+        state: present
+
+    # ── Node.js 18 via NodeSource ──────────────────────────────
+    - name: Download NodeSource setup script for Node.js 18
+      get_url:
+        url: "https://deb.nodesource.com/setup_{{ node_version }}.x"
+        dest: /tmp/nodesource_setup.sh
+        mode: "0755"
+
+    - name: Run NodeSource setup script
+      command: bash /tmp/nodesource_setup.sh
+      args:
+        creates: /etc/apt/sources.list.d/nodesource.list
+
+    - name: Install Node.js and npm
+      apt:
+        name: nodejs
+        state: present
+        update_cache: true
+
+    - name: Verify Node.js version
+      command: node --version
+      register: node_ver
+      changed_when: false
+
+    - name: Print Node.js version
+      debug:
+        msg: "Node.js installed: {{ node_ver.stdout }}"
+
+    # ── pm2 (process manager) ──────────────────────────────────
+    - name: Install pm2 globally
+      npm:
+        name: pm2
+        global: true
+        state: present
+
+    # ── Clone / update repository ──────────────────────────────
+    - name: Clone CV Generator repository
+      git:
+        repo: "{{ app_repo }}"
+        dest: "{{ app_dir }}"
+        version: main
+        force: true
+      become_user: ubuntu
+
+    # ── Install backend dependencies ───────────────────────────
+    - name: Run npm install in backend folder
+      npm:
+        path: "{{ app_dir }}/backend"
+        state: present
+      become_user: ubuntu
+
+    # ── Environment file ───────────────────────────────────────
+    - name: Check if backend .env already exists
+      stat:
+        path: "{{ app_dir }}/backend/.env"
+      register: env_file
+
+    - name: Create backend .env placeholder (skip if already present)
+      copy:
+        dest: "{{ app_dir }}/backend/.env"
+        content: |
+          # Add your Anthropic API key here
+          ANTHROPIC_API_KEY=your_anthropic_api_key_here
+          PORT=3000
+        owner: ubuntu
+        group: ubuntu
+        mode: "0600"
+      when: not env_file.stat.exists
+
+    # ── Start app with pm2 ────────────────────────────────────
+    - name: Stop existing pm2 process (if any)
+      command: pm2 delete cv-generator
+      become_user: ubuntu
+      ignore_errors: true
+
+    - name: Start Node.js server with pm2
+      command: >
+        pm2 start {{ app_dir }}/backend/server.js
+        --name cv-generator
+        --interpreter node
+      args:
+        chdir: "{{ app_dir }}/backend"
+      become_user: ubuntu
+
+    - name: Save pm2 process list
+      command: pm2 save
+      become_user: ubuntu
+
+    - name: Set up pm2 to restart on system reboot
+      command: pm2 startup systemd -u ubuntu --hp /home/ubuntu
+      register: pm2_startup
+
+    - name: Enable pm2 startup service
+      command: "{{ pm2_startup.stdout_lines | select('match', '^sudo') | first }}"
+      when: pm2_startup.stdout_lines | select('match', '^sudo') | list | length > 0
+
+    # ── nginx configuration ────────────────────────────────────
+    - name: Remove default nginx site
+      file:
+        path: /etc/nginx/sites-enabled/default
+        state: absent
+
+    - name: Write nginx config (static frontend + /api proxy)
+      copy:
+        dest: /etc/nginx/sites-available/cv-generator
+        content: |
+          server {
+              listen 80;
+              server_name _;
+
+              # Serve static frontend files directly
+              root /home/ubuntu/CV-Generator/frontend;
+              index index.html;
+
+              # Frontend – serve files, fall back to index.html
+              location / {
+                  try_files $uri $uri/ /index.html;
+              }
+
+              # API – proxy to Node.js backend on port 3000
+              location /api/ {
+                  proxy_pass         http://localhost:3000;
+                  proxy_http_version 1.1;
+                  proxy_set_header   Upgrade $http_upgrade;
+                  proxy_set_header   Connection 'upgrade';
+                  proxy_set_header   Host $host;
+                  proxy_set_header   X-Real-IP $remote_addr;
+                  proxy_set_header   X-Forwarded-For $proxy_add_x_forwarded_for;
+                  proxy_cache_bypass $http_upgrade;
+              }
+          }
+        mode: "0644"
+
+    - name: Enable cv-generator nginx site
+      file:
+        src: /etc/nginx/sites-available/cv-generator
+        dest: /etc/nginx/sites-enabled/cv-generator
+        state: link
+
+    - name: Test nginx configuration
+      command: nginx -t
+      changed_when: false
+
+    - name: Restart and enable nginx
+      systemd:
+        name: nginx
+        state: restarted
+        enabled: true
+
+    # ── Firewall (ufw) ─────────────────────────────────────────
+    - name: Allow SSH through firewall
+      ufw:
+        rule: allow
+        port: "22"
+        proto: tcp
+
+    - name: Allow HTTP through firewall
+      ufw:
+        rule: allow
+        port: "80"
+        proto: tcp
+
+    - name: Allow Node.js port through firewall
+      ufw:
+        rule: allow
+        port: "3000"
+        proto: tcp
+
+    - name: Enable ufw
+      ufw:
+        state: enabled
+        policy: deny
+
+    # ── Summary ───────────────────────────────────────────────
+    - name: Deployment complete
+      debug:
+        msg:
+          - "✅ CV Generator deployed successfully!"
+          - "🌐 App running at: http://{{ ansible_host }}"
+          - "🔧 Node.js direct: http://{{ ansible_host }}:3000"
+          - "📝 Remember to add your ANTHROPIC_API_KEY to {{ app_dir }}/backend/.env"
